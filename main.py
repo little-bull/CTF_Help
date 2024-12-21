@@ -131,7 +131,6 @@ class Frame():
         pass
 
     def cal_total_dis(self, Q):
-        Q = Q / (self.box.x_max - self.box.x_min)
         # 确保输入是 numpy 数组
         positions = np.array(self.atom_list)
 
@@ -140,26 +139,35 @@ class Frame():
 
         # 计算欧几里得距离矩阵
         distance_matrix = np.linalg.norm(diff, axis=-1)  # (N, N)
-        distance_matrix = distance_matrix * Q
+        
         # 排除自身距离（对角线元素为 0）
         np.fill_diagonal(distance_matrix, 0)
+        
+        distance_matrix = distance_matrix * Q
+        sin_distance_matrix = np.sin(distance_matrix)
 
-        # 计算距离的总和
-        total_distance = np.sum(distance_matrix)
+        ratio_matrix = sin_distance_matrix / distance_matrix
 
-        # 计算 sin 值矩阵
-        sin_matrix = np.sin(distance_matrix)
+        sum_ratio = np.nansum(ratio_matrix)
 
-        # 计算 sin 值的总和
-        total_sin = np.sum(sin_matrix)
+        # # 计算距离的总和
+        # total_distance = np.sum(distance_matrix)
+
+        # # 计算 sin 值矩阵
+        # sin_matrix = np.sin(distance_matrix)
+
+        # # 计算 sin 值的总和
+        # total_sin = np.sum(sin_matrix)
 
 
         N = len(self.atom_list)
         K = 1 / ((N + 1) * (N + 1)) 
-        # log_info(N,K,total_dis)
-        # print(Q,total_sin,total_distance)
-        self.total_dis = K * (total_sin / total_distance)
 
+
+        # log_info(Q,sum_ratio)
+
+
+        self.total_dis = K * sum_ratio
 
     def get_total_dis(self):
         return self.total_dis
@@ -241,7 +249,7 @@ class AverageCalculator():
     # 多线程的方式计算，max_workers = 你电脑的线程数
     def cal_arvage_multithread(self, Q):
         frame_total = 0
-        with ProcessPoolExecutor(max_workers=3) as executor:  # 创建线程池
+        with ProcessPoolExecutor(max_workers=1) as executor:  # 创建线程池
             future_to_frame = {executor.submit(frame.cal_total_dis, Q): frame for frame in self.frames}
             for future in as_completed(future_to_frame):
                 frame = future_to_frame[future]
@@ -291,21 +299,27 @@ def main():
 
     for file_name in file_names:
         file_path = os.path.join(DATA_DIR,file_name)
-        q0, qmax, M = 1 * 2 * math.pi,200 * 2 * math.pi, 200
+        ac = AverageCalculator(file_path)
+        begin_n, end_n = 1, 2
+        L = 300
+        q0, qmax, M = begin_n * 2 * math.pi / L,end_n * 2 * math.pi / L, end_n
         result = []
+        count = 0
         for Q in Q_generator(q0, qmax, M):
-            log_info("cal_begin", int(time.time()))
-            P,Q = ac.format_print_cal_result(Q,True)
+            count += 1
+            log_info("cal_begin : " + str(count), int(time.time()))
+            P,Q = ac.format_print_cal_result(Q,False)
             result_line = "{}      {}".format(Q,P)
+            # log_info(result_line)
             result.append(result_line)
-            log_info("cal_end", int(time.time()))
+            log_info("cal_end : " + str(count), int(time.time()))
 
         save_result(file_name, result)
 
 def spilit2test():
     contentList = []
     with open("data/md100.atom","r") as f:
-        for i in range(5009 * 20 - 1):
+        for i in range(5009 * 5 - 1):
             contentList.append(f.readline())
     with open("data/test.atom","w") as f:
         f.write("".join(contentList))

@@ -2,9 +2,14 @@ import os
 import math
 import time
 import numpy as np
+import multiprocessing
 from functools import cache
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from multiprocessing import shared_memory, Manager
+from multiprocessing import Array
+
+np.seterr(divide='ignore', invalid='ignore')
+
 
 def log_error(*args):
     print("error : ", *args)
@@ -27,6 +32,9 @@ def Q_generator(q0, qmax, M):
         # print(cur,qmax)
         yield cur
         cur += step
+
+def test():
+    return 0
 
 class Pos():
     def __init__(self,x = 0, y = 0, z = 0):
@@ -71,18 +79,17 @@ class Atom():
         self.atom_id = atom_id
         self.atom_type = atom_type
         self.pos = Pos(x, y, z)
-        self.cache_dis_dict = {}
 
     def dis(self, other):
         # cache一下加快避免重复计算
-        if self.atom_id in other.cache_dis_dict:
-            return other.cache_dis_dict[self.atom_id]
-        if other.atom_id in self.cache_dis_dict:
-            return self.cache_dis_dict[other.atom_id]
+        # if self.atom_id in other.cache_dis_dict:
+        #     return other.cache_dis_dict[self.atom_id]
+        # if other.atom_id in self.cache_dis_dict:
+        #     return self.cache_dis_dict[other.atom_id]
 
         dis = self.pos.dis(other.pos)
-        self.cache_dis_dict[other.atom_id] = dis
-        other.cache_dis_dict[self.atom_id] = dis
+        # self.cache_dis_dict[other.atom_id] = dis
+        # other.cache_dis_dict[self.atom_id] = dis
 
         return dis
 
@@ -102,13 +109,14 @@ class Atom():
         return hash(self.atom_id)
 
 class Frame():
-    def __init__(self):
+    def __init__(self,multithread):
         self.atom_list = []
         self.atom_count = 0
         self.box = None
         self.total_dis = 0
         self.frame_id = -1
-        self.caled = False
+        self.multithread = multithread
+        self.K = 0
 
     def set_frame_id(self, frame_id):
         self.frame_id = frame_id
@@ -129,20 +137,8 @@ class Frame():
     def set_box(self, box):
         self.box = box
 
-    def cal_old(self,Q):
-        pass
-
-    def cal_total_dis(self, Q):
-        if self.caled:
-            distance_matrix = self.distance_matrix
-            distance_matrix = distance_matrix * Q
-            sin_distance_matrix = np.sin(distance_matrix)
-            ratio_matrix = sin_distance_matrix / distance_matrix
-            sum_ratio = np.nansum(ratio_matrix)
-            self.total_dis = self.K * sum_ratio
-            return 
+    def cal_init(self):
         # 确保输入是 numpy 数组
-        np.seterr(divide='ignore', invalid='ignore')
         positions = np.array(self.atom_list)
 
         # 使用广播机制计算两两点之间的向量差
@@ -150,33 +146,51 @@ class Frame():
 
         # 计算欧几里得距离矩阵
         distance_matrix = np.linalg.norm(diff, axis=-1)  # (N, N)
-        
-        # 排除自身距离（对角线元素为 0）
         np.fill_diagonal(distance_matrix, 0)
-        
-        # 保存计算结果
-        self.distance_matrix = distance_matrix
-        self.caled = True
-
-        distance_matrix = distance_matrix * Q
-        sin_distance_matrix = np.sin(distance_matrix)
-        ratio_matrix = sin_distance_matrix / distance_matrix
-        sum_ratio = np.nansum(ratio_matrix)
-
         N = len(self.atom_list)
         K = 1 / ((N + 1) * (N + 1)) 
         self.K = K
 
-        self.total_dis = K * sum_ratio
+        if not self.multithread:
+            self.distance_matrix = distance_matrix
+        else:
+            self.distance_matrix = distance_matrix
+        self.atom_list = []
 
-    def get_total_dis(self):
-        return self.total_dis
+
+    def cal_total_dis_worker(self, Q):
+        # print("xxxx",Q)
+        # 使用共享内存中的数据
+        # np_array = np.frombuffer(frame.shared_array.get_obj(), dtype=np.float64).reshape(shape)
+        # np_array = np.frombuffer(frame.shared_array.get_obj(), dtype=np.float64).reshape(shape)
+        
+        # 执行计算
+        # distance_matrix = self.distance_matrix 
+        total_dis = 0
+        distance_matrix = self.distance_matrix * Q
+        sin_distance_matrix = np.sin(distance_matrix)
+        ratio_matrix = sin_distance_matrix / distance_matrix
+        sum_ratio = np.nansum(ratio_matrix)
+        total_dis = self.K * sum_ratio
+
+        return total_dis
+
+    def cal_total_dis(self, Q, shape = None):
+        distance_matrix = self.distance_matrix * Q
+        sin_distance_matrix = np.sin(distance_matrix)
+        ratio_matrix = sin_distance_matrix / distance_matrix
+        sum_ratio = np.nansum(ratio_matrix)
+        
+        total_dis = self.K * sum_ratio
+
+        return total_dis
+
 
 
 class AverageCalculator():
-    def __init__(self, file_path, atom_chain_count = 100):
+    def __init__(self, file_path, multithread):
         self.file_lines = file_line_generator(file_path)
-        self.atom_chain_count = atom_chain_count
+        self.multithread = multithread
         self.frames = []
         self.parse_frames()
 
@@ -201,7 +215,7 @@ class AverageCalculator():
         for line in self.file_lines:
             # 新建一个frame
             if line_index == 0:
-                self.frames.append(Frame())
+                self.frames.append(Frame(self.multithread))
             elif line_index == 1:
                 frame_id = int(line)
                 self.frames[-1].set_frame_id(frame_id)
@@ -237,23 +251,14 @@ class AverageCalculator():
             #重新添加下一个frame
             if line_index == self.frames[-1].get_atom_count() + 9:
                 line_index = 0
+        for frame in self.frames:
+            frame.cal_init()
 
     # 单线程
     def cal_arvage(self, Q):
         frame_total = 0
         for frame in self.frames:
-            frame.cal_total_dis(Q)
-            frame_total += frame.get_total_dis()
-        return frame_total / len(self.frames)
-
-    # 多线程的方式计算，max_workers = 你电脑的线程数
-    def cal_arvage_multithread(self, Q, max_workers):
-        frame_total = 0
-        with ProcessPoolExecutor(max_workers=max_workers) as executor:  # 创建线程池
-            future_to_frame = {executor.submit(frame.cal_total_dis, Q): frame for frame in self.frames}
-            for future in as_completed(future_to_frame):
-                frame = future_to_frame[future]
-                frame_total += frame.get_total_dis()
+            frame_total = frame.cal_total_dis(Q)
         return frame_total / len(self.frames)
 
     def format_print_cal_result(self, Q , multithread, max_workers):
@@ -264,6 +269,25 @@ class AverageCalculator():
         else:
             P = self.cal_arvage(Q) 
         return format(P, ".15e"),format(Q, ".15e")
+
+    # 修改多线程的计算方法，使用共享内存
+    def cal_arvage_multithread(self, Q, max_workers):
+        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            features = {}
+            futures = {executor.submit(frame.cal_total_dis_worker, Q): frame for frame in self.frames}
+            # futures = {executor.submit(test): i for i in range(10)}
+            frame_total = 0
+            # 等待所有进程完成并更新结果
+            for future in as_completed(futures):
+                try:
+                    frame_one = future.result()  # 捕获结果
+                    frame_total += frame_one
+                except Exception as e:
+                    log_error("Error occurred: ", e)  # 处理可能的异常
+
+            return frame_total 
+
+
 
 
 # 获取当前文件所在的目录
@@ -304,25 +328,29 @@ def main():
     L = 300
     q0, qmax, M = begin_n * 2 * math.pi / L,end_n * 2 * math.pi / L, end_n
     multithread = True
-    max_workers = 1
+    max_workers = 5
     # 参数定义
 
 
     for file_name in file_names:
-        file_path = os.path.join(DATA_DIR,file_name)
-        ac = AverageCalculator(file_path)
+        file_path = os.path.join(DATA_DIR, file_name)
+        ac = AverageCalculator(file_path, multithread)
         result = []
         count = 0
         save_result_pre(file_name)
         for Q in Q_generator(q0, qmax, M):
             count += 1
             log_info("cal_begin : " + str(count), int(time.time()))
-            P,Q = ac.format_print_cal_result(Q,False,max_workers)
+            P,Q = ac.format_print_cal_result(Q, multithread, max_workers)
             result_line = "{}      {}\n".format(Q,P)
             # log_info(result_line)
-            # result.append(result_line)
+            result.append(result_line)
             log_info("cal_end : " + str(count), int(time.time()))
             save_result(file_name, result_line)
+
+                # 释放所有 frame 的共享内存
+            # ac.cal_arvage_multithread(Q, max_workers)
+
 
 def spilit2test():
     contentList = []
@@ -336,42 +364,9 @@ def print_help():
     print("1.文件放入data目录")
     print("2.结果产出在result目录")
 
-# def test():
-    # Q = 1
-    # # 确保输入是 numpy 数组
-    # positions = np.array([[1,1,1],[0,0,0]])
-
-    # # 使用广播机制计算两两点之间的向量差
-    # diff = positions[:, np.newaxis, :] - positions[np.newaxis, :, :]  # (N, N, 3)
-    # print(diff)
-    # # 计算欧几里得距离矩阵
-    # distance_matrix = np.linalg.norm(diff, axis=-1)  # (N, N)
-    # print(distance_matrix)
-    # distance_matrix = distance_matrix * Q
-    # # 排除自身距离（对角线元素为 0）
-    # np.fill_diagonal(distance_matrix, 0)
-
-    # # 计算距离的总和
-    # total_distance = np.sum(distance_matrix)
-
-    # # 计算 sin 值矩阵
-    # sin_matrix = np.sin(distance_matrix)
-
-    # # 计算 sin 值的总和
-    # total_sin = np.sum(sin_matrix)
-
-    # print(total_sin,total_distance)
-
-    # N = len(self.atom_list)
-    # K = 1 / ((N + 1) * (N + 1)) 
-    # log_info(N,K,total_dis)
-    # print(Q,total_sin,total_distance)
-    # self.total_dis = K * (total_sin / total_distance)
-
 if __name__ == '__main__':
     print_help()
     main()
-    # test()
     # spilit2test()
 
 

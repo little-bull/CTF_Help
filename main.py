@@ -108,6 +108,24 @@ class Atom():
     def __hash__(self):
         return hash(self.atom_id)
 
+def cal_total_dis_worker(frame, Q):
+    # print("xxxx",Q)
+    # 使用共享内存中的数据
+    # np_array = np.frombuffer(frame.shared_array.get_obj(), dtype=np.float64).reshape(shape)
+    # np_array = np.frombuffer(frame.shared_array.get_obj(), dtype=np.float64).reshape(shape)
+    
+    # 执行计算
+    # distance_matrix = self.distance_matrix 
+    total_dis = 0
+    # print(type(frame.distance_matrix))
+    distance_matrix = frame.distance_matrix * Q
+    sin_distance_matrix = np.sin(distance_matrix)
+    ratio_matrix = sin_distance_matrix / distance_matrix
+    sum_ratio = np.nansum(ratio_matrix)
+    total_dis = frame.K * sum_ratio
+    # print(Q,frame.K,total_dis)
+    return total_dis
+
 class Frame():
     def __init__(self,multithread):
         self.atom_list = []
@@ -154,34 +172,20 @@ class Frame():
         if not self.multithread:
             self.distance_matrix = distance_matrix
         else:
+            # manager = multiprocessing.Manager()
+            # self.distance_matrix = manager.list(distance_matrix)
             self.distance_matrix = distance_matrix
-        self.atom_list = []
 
 
-    def cal_total_dis_worker(self, Q):
-        # print("xxxx",Q)
-        # 使用共享内存中的数据
-        # np_array = np.frombuffer(frame.shared_array.get_obj(), dtype=np.float64).reshape(shape)
-        # np_array = np.frombuffer(frame.shared_array.get_obj(), dtype=np.float64).reshape(shape)
-        
-        # 执行计算
-        # distance_matrix = self.distance_matrix 
-        total_dis = 0
-        distance_matrix = self.distance_matrix * Q
-        sin_distance_matrix = np.sin(distance_matrix)
-        ratio_matrix = sin_distance_matrix / distance_matrix
-        sum_ratio = np.nansum(ratio_matrix)
-        total_dis = self.K * sum_ratio
 
-        return total_dis
-
-    def cal_total_dis(self, Q, shape = None):
+    def cal_total_dis(self, Q):
         distance_matrix = self.distance_matrix * Q
         sin_distance_matrix = np.sin(distance_matrix)
         ratio_matrix = sin_distance_matrix / distance_matrix
         sum_ratio = np.nansum(ratio_matrix)
         
         total_dis = self.K * sum_ratio
+        # print(Q,self.K,total_dis)
 
         return total_dis
 
@@ -251,14 +255,13 @@ class AverageCalculator():
             #重新添加下一个frame
             if line_index == self.frames[-1].get_atom_count() + 9:
                 line_index = 0
-        for frame in self.frames:
-            frame.cal_init()
 
     # 单线程
     def cal_arvage(self, Q):
         frame_total = 0
         for frame in self.frames:
-            frame_total = frame.cal_total_dis(Q)
+            frame_total += frame.cal_total_dis(Q)
+        # print(Q,frame_total,len(self.frames))
         return frame_total / len(self.frames)
 
     def format_print_cal_result(self, Q , multithread, max_workers):
@@ -272,11 +275,11 @@ class AverageCalculator():
 
     # 修改多线程的计算方法，使用共享内存
     def cal_arvage_multithread(self, Q, max_workers):
+        frame_total = 0
         with ProcessPoolExecutor(max_workers=max_workers) as executor:
             features = {}
-            futures = {executor.submit(frame.cal_total_dis_worker, Q): frame for frame in self.frames}
+            futures = {executor.submit(cal_total_dis_worker, frame, Q): frame for frame in self.frames}
             # futures = {executor.submit(test): i for i in range(10)}
-            frame_total = 0
             # 等待所有进程完成并更新结果
             for future in as_completed(futures):
                 try:
@@ -284,8 +287,9 @@ class AverageCalculator():
                     frame_total += frame_one
                 except Exception as e:
                     log_error("Error occurred: ", e)  # 处理可能的异常
-
-            return frame_total 
+        # print(Q,frame_total)
+        # print(Q,frame_total,len(self.frames))
+        return frame_total / len(self.frames)
 
 
 
@@ -324,10 +328,10 @@ def main():
     # file_names.append("md175.atom")
 
     # 参数定义
-    begin_n, end_n = 1, 10
+    begin_n, end_n = 1, 2
     L = 300
     q0, qmax, M = begin_n * 2 * math.pi / L,end_n * 2 * math.pi / L, end_n
-    multithread = True
+    multithread = False
     max_workers = 5
     # 参数定义
 

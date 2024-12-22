@@ -2,14 +2,13 @@ import os
 import math
 import time
 import numpy as np
-import multiprocessing
 from functools import cache
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from multiprocessing import shared_memory, Manager
-from multiprocessing import Array
+from multiprocessing import Process, Manager, shared_memory
+import multiprocessing
 
 np.seterr(divide='ignore', invalid='ignore')
-
 
 def log_error(*args):
     print("error : ", *args)
@@ -28,13 +27,9 @@ def file_line_generator(file_path):
 def Q_generator(q0, qmax, M):
     step = (qmax - q0) / M
     cur = q0
-    while abs(cur - qmax) > (10 ** (-16)):
-        # print(cur,qmax)
+    while cur < qmax:
         yield cur
         cur += step
-
-def test():
-    return 0
 
 class Pos():
     def __init__(self,x = 0, y = 0, z = 0):
@@ -79,17 +74,18 @@ class Atom():
         self.atom_id = atom_id
         self.atom_type = atom_type
         self.pos = Pos(x, y, z)
+        self.cache_dis_dict = {}
 
     def dis(self, other):
         # cache一下加快避免重复计算
-        # if self.atom_id in other.cache_dis_dict:
-        #     return other.cache_dis_dict[self.atom_id]
-        # if other.atom_id in self.cache_dis_dict:
-        #     return self.cache_dis_dict[other.atom_id]
+        if self.atom_id in other.cache_dis_dict:
+            return other.cache_dis_dict[self.atom_id]
+        if other.atom_id in self.cache_dis_dict:
+            return self.cache_dis_dict[other.atom_id]
 
         dis = self.pos.dis(other.pos)
-        # self.cache_dis_dict[other.atom_id] = dis
-        # other.cache_dis_dict[self.atom_id] = dis
+        self.cache_dis_dict[other.atom_id] = dis
+        other.cache_dis_dict[self.atom_id] = dis
 
         return dis
 
@@ -108,33 +104,19 @@ class Atom():
     def __hash__(self):
         return hash(self.atom_id)
 
-def cal_total_dis_worker(frame, Q):
-    # print("xxxx",Q)
-    # 使用共享内存中的数据
-    # np_array = np.frombuffer(frame.shared_array.get_obj(), dtype=np.float64).reshape(shape)
-    # np_array = np.frombuffer(frame.shared_array.get_obj(), dtype=np.float64).reshape(shape)
-    
-    # 执行计算
-    # distance_matrix = self.distance_matrix 
-    total_dis = 0
-    # print(type(frame.distance_matrix))
-    distance_matrix = frame.distance_matrix * Q
-    sin_distance_matrix = np.sin(distance_matrix)
-    ratio_matrix = sin_distance_matrix / distance_matrix
-    sum_ratio = np.nansum(ratio_matrix)
-    total_dis = frame.K * sum_ratio
-    # print(Q,frame.K,total_dis)
-    return total_dis
-
 class Frame():
-    def __init__(self,multithread):
+    def __init__(self):
         self.atom_list = []
         self.atom_count = 0
         self.box = None
         self.total_dis = 0
         self.frame_id = -1
-        self.multithread = multithread
-        self.K = 0
+
+    def init_share_mem(self):
+        pass
+
+        # self.lock = 
+        # self.caled =
 
     def set_frame_id(self, frame_id):
         self.frame_id = frame_id
@@ -155,7 +137,10 @@ class Frame():
     def set_box(self, box):
         self.box = box
 
-    def cal_init(self):
+    def get_distance_matrix(self):
+        if self.distance_matrix :
+            return self.distance_matrix
+
         # 确保输入是 numpy 数组
         positions = np.array(self.atom_list)
 
@@ -164,29 +149,111 @@ class Frame():
 
         # 计算欧几里得距离矩阵
         distance_matrix = np.linalg.norm(diff, axis=-1)  # (N, N)
+        
+        # 排除自身距离（对角线元素为 0）
         np.fill_diagonal(distance_matrix, 0)
-        N = len(self.atom_list)
-        K = 1 / ((N + 1) * (N + 1)) 
-        self.K = K
+        shape = distance_matrix.shape
 
-        if not self.multithread:
-            self.distance_matrix = distance_matrix
-        else:
-            # manager = multiprocessing.Manager()
-            # self.distance_matrix = manager.list(distance_matrix)
-            self.distance_matrix = distance_matrix
+        # 获取数组的数据类型 (dtype)
+        dtype = distance_matrix.dtype
 
+        print(f"数组的形状x: {shape}")
+        print(f"数组的数据类型x: {dtype}")
+
+        self.distance_matrix = distance_matrix
 
 
     def cal_total_dis(self, Q):
-        distance_matrix = self.distance_matrix * Q
-        sin_distance_matrix = np.sin(distance_matrix)
-        ratio_matrix = sin_distance_matrix / distance_matrix
-        sum_ratio = np.nansum(ratio_matrix)
-        
-        total_dis = self.K * sum_ratio
-        # print(Q,self.K,total_dis)
+        distance_matrix = self.distance_matrix
 
+        distance_matrix = distance_matrix * Q
+        sin_distance_matrix = np.sin(distance_matrix)
+
+        ratio_matrix = sin_distance_matrix / distance_matrix
+
+        sum_ratio = np.nansum(ratio_matrix)
+
+        # # 计算距离的总和
+        # total_distance = np.sum(distance_matrix)
+
+        # # 计算 sin 值矩阵
+        # sin_matrix = np.sin(distance_matrix)
+
+        # # 计算 sin 值的总和
+        # total_sin = np.sum(sin_matrix)
+
+
+        N = self.atom_count
+        K = 1 / ((N + 1) * (N + 1)) 
+
+
+        # log_info(Q,sum_ratio)
+
+
+        total_dis = K * sum_ratio
+        return total_dis
+
+
+
+class ProcessFrame(Frame):
+    def __init__(self):
+        super().__init__()
+
+    def init_share_mem(self):
+        l = len(self.atom_list)
+        self.shape = (l, l)
+        self.dtype = np.float64
+
+        # 计算共享内存的大小
+        size = np.prod(self.shape) * np.dtype(self.dtype).itemsize
+        
+        # 创建共享内存块
+        self.shm = shared_memory.SharedMemory(create=True, size=size)
+        self.shm_name = self.shm.name
+
+        # self.lock = multiprocessing.Lock()
+        # self.caled = multiprocessing.Value('b', False)
+        # print(self.frame_id,self.shm,"xxxx")
+
+    def init_distance_matrix(self):
+        # print("1")
+        # 确保输入是 numpy 数组
+        positions = np.array(self.atom_list)
+
+        # 使用广播机制计算两两点之间的向量差
+        diff = positions[:, np.newaxis, :] - positions[np.newaxis, :, :]  # (N, N, 3)
+
+        # 计算欧几里得距离矩阵
+        distance_matrix = np.linalg.norm(diff, axis=-1)  # (N, N)
+        
+        # 排除自身距离（对角线元素为 0）
+        np.fill_diagonal(distance_matrix, 0)
+
+        existing_shm = shared_memory.SharedMemory(name=self.shm_name)
+        share_arr = np.ndarray(self.shape, dtype=self.dtype, buffer=existing_shm.buf)
+        share_arr[:] = distance_matrix
+        # print("2")
+
+    def cal_total_dis(self, Q):
+        # self.init_distance_matrix()
+
+        existing_shm = shared_memory.SharedMemory(name=self.shm_name)
+        distance_matrix = np.ndarray(self.shape, dtype=self.dtype, buffer=existing_shm.buf)
+
+        # print(distance_matrix)
+
+        new_distance_matrix = distance_matrix * Q
+        sin_distance_matrix = np.sin(new_distance_matrix)
+
+        ratio_matrix = sin_distance_matrix / new_distance_matrix
+
+        sum_ratio = np.nansum(ratio_matrix)
+
+        N = self.atom_count
+        K = 1 / ((N + 1) * (N + 1)) 
+
+
+        total_dis = K * sum_ratio
         return total_dis
 
 
@@ -219,7 +286,10 @@ class AverageCalculator():
         for line in self.file_lines:
             # 新建一个frame
             if line_index == 0:
-                self.frames.append(Frame(self.multithread))
+                if self.multithread:
+                    self.frames.append(ProcessFrame())
+                else:
+                    self.frames.append(Frame())
             elif line_index == 1:
                 frame_id = int(line)
                 self.frames[-1].set_frame_id(frame_id)
@@ -255,43 +325,47 @@ class AverageCalculator():
             #重新添加下一个frame
             if line_index == self.frames[-1].get_atom_count() + 9:
                 line_index = 0
+        for frame in self.frames:
+            frame.init_share_mem()
 
-    # 单线程
+    # 单进程
     def cal_arvage(self, Q):
         frame_total = 0
         for frame in self.frames:
             frame_total += frame.cal_total_dis(Q)
-        # print(Q,frame_total,len(self.frames))
         return frame_total / len(self.frames)
 
-    def format_print_cal_result(self, Q , multithread, max_workers):
+    def release(self):
+        if self.multithread:
+            for frame in self.frames:
+                # 清理共享内存
+                frame.shm.close()
+                frame.shm.unlink()
+
+    # 多线程的方式计算，max_workers = 你电脑的线程数
+    def cal_arvage_multithread(self, Q, max_workers):
+        frame_total = 0
+        with ProcessPoolExecutor(max_workers=max_workers) as executor:  # 创建线程池
+            future_to_frame = {executor.submit(frame.cal_total_dis, Q): frame for frame in self.frames}
+            for future in as_completed(future_to_frame):
+                frame = future_to_frame[future]
+                frame_total += future.result()
+        return frame_total / len(self.frames)
+
+    def cal_arvage_multithread_init(self,max_workers):
+        with ProcessPoolExecutor(max_workers=max_workers) as executor:  # 创建线程池
+            future_to_frame = {executor.submit(frame.init_distance_matrix): frame for frame in self.frames}
+            for future in as_completed(future_to_frame):
+                print("init ",future_to_frame[future].frame_id)
+
+    def format_print_cal_result(self, Q, max_workers):
         # P = self.cal_arvage(Q)
         P = 0
-        if multithread:
+        if self.multithread:
             P = self.cal_arvage_multithread(Q, max_workers)
         else:
             P = self.cal_arvage(Q) 
         return format(P, ".15e"),format(Q, ".15e")
-
-    # 修改多线程的计算方法，使用共享内存
-    def cal_arvage_multithread(self, Q, max_workers):
-        frame_total = 0
-        with ProcessPoolExecutor(max_workers=max_workers) as executor:
-            features = {}
-            futures = {executor.submit(cal_total_dis_worker, frame, Q): frame for frame in self.frames}
-            # futures = {executor.submit(test): i for i in range(10)}
-            # 等待所有进程完成并更新结果
-            for future in as_completed(futures):
-                try:
-                    frame_one = future.result()  # 捕获结果
-                    frame_total += frame_one
-                except Exception as e:
-                    log_error("Error occurred: ", e)  # 处理可能的异常
-        # print(Q,frame_total)
-        # print(Q,frame_total,len(self.frames))
-        return frame_total / len(self.frames)
-
-
 
 
 # 获取当前文件所在的目录
@@ -302,17 +376,14 @@ current_file_path = os.path.abspath(__file__)
 DATA_DIR = os.path.join(CUR_DIR, "data")
 RESULT_DIR = os.path.join(CUR_DIR, "result")
 
-def save_result(file_name, result_line):
-    file_path = os.path.join(RESULT_DIR, file_name.replace("atom","dat"))
-    with open(file_path,"a") as f:
-        f.write(result_line)
-
-def save_result_pre(file_name):
+def save_result(file_name, result):
     file_path = os.path.join(RESULT_DIR, file_name.replace("atom","dat"))
     with open(file_path,"w") as f:
         f.write("# Total structure factor for atom types: \n")
         f.write("# { 1(5) }in system. \n")
         f.write("# Q-values       P(Q)  \n")
+        f.write("\n".join(result))
+
 
 
 def main():
@@ -327,39 +398,37 @@ def main():
     # file_names.append("md150.atom")
     # file_names.append("md175.atom")
 
-    # 参数定义
-    begin_n, end_n = 1, 2
+    begin_n, end_n = 1, 5
     L = 300
     q0, qmax, M = begin_n * 2 * math.pi / L,end_n * 2 * math.pi / L, end_n
-    multithread = False
-    max_workers = 5
-    # 参数定义
-
+    multithread = True
+    max_workers = 3
 
     for file_name in file_names:
-        file_path = os.path.join(DATA_DIR, file_name)
-        ac = AverageCalculator(file_path, multithread)
+        file_path = os.path.join(DATA_DIR,file_name)
+        ac = AverageCalculator(file_path,multithread)
         result = []
         count = 0
-        save_result_pre(file_name)
-        for Q in Q_generator(q0, qmax, M):
+        if multithread:
+            ac.cal_arvage_multithread_init(max_workers)
+
+        for Q in np.linspace(q0, qmax, M):
             count += 1
             log_info("cal_begin : " + str(count), int(time.time()))
-            P,Q = ac.format_print_cal_result(Q, multithread, max_workers)
-            result_line = "{}      {}\n".format(Q,P)
+            P,Q = ac.format_print_cal_result(Q,max_workers)
+            result_line = "{}      {}".format(Q,P)
             # log_info(result_line)
             result.append(result_line)
             log_info("cal_end : " + str(count), int(time.time()))
-            save_result(file_name, result_line)
 
-                # 释放所有 frame 的共享内存
-            # ac.cal_arvage_multithread(Q, max_workers)
+            save_result(file_name, result)
+        ac.release()
 
 
 def spilit2test():
     contentList = []
     with open("data/md100.atom","r") as f:
-        for i in range(5009 * 5 - 1):
+        for i in range(5009 * 10 - 1):
             contentList.append(f.readline())
     with open("data/test.atom","w") as f:
         f.write("".join(contentList))
@@ -368,10 +437,43 @@ def print_help():
     print("1.文件放入data目录")
     print("2.结果产出在result目录")
 
+# def test():
+    # Q = 1
+    # # 确保输入是 numpy 数组
+    # positions = np.array([[1,1,1],[0,0,0]])
+
+    # # 使用广播机制计算两两点之间的向量差
+    # diff = positions[:, np.newaxis, :] - positions[np.newaxis, :, :]  # (N, N, 3)
+    # print(diff)
+    # # 计算欧几里得距离矩阵
+    # distance_matrix = np.linalg.norm(diff, axis=-1)  # (N, N)
+    # print(distance_matrix)
+    # distance_matrix = distance_matrix * Q
+    # # 排除自身距离（对角线元素为 0）
+    # np.fill_diagonal(distance_matrix, 0)
+
+    # # 计算距离的总和
+    # total_distance = np.sum(distance_matrix)
+
+    # # 计算 sin 值矩阵
+    # sin_matrix = np.sin(distance_matrix)
+
+    # # 计算 sin 值的总和
+    # total_sin = np.sum(sin_matrix)
+
+    # print(total_sin,total_distance)
+
+    # N = len(self.atom_list)
+    # K = 1 / ((N + 1) * (N + 1)) 
+    # log_info(N,K,total_dis)
+    # print(Q,total_sin,total_distance)
+    # self.total_dis = K * (total_sin / total_distance)
+
 if __name__ == '__main__':
     print_help()
+    spilit2test()
     main()
-    # spilit2test()
+    # test()
 
 
 

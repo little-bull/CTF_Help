@@ -2,6 +2,10 @@ import os
 import math
 import time
 import numpy as np
+import shutil
+from scipy.spatial.distance import cdist
+from scipy.sparse import csr_matrix
+from scipy.sparse import coo_matrix
 from functools import cache
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -15,6 +19,8 @@ current_file_path = os.path.abspath(__file__)
 
 DATA_DIR = os.path.join(CUR_DIR, "data")
 RESULT_DIR = os.path.join(CUR_DIR, "result")
+TMP_DIR = os.path.join(CUR_DIR, "tmp")
+
 
 
 
@@ -137,34 +143,42 @@ class Frame():
         self.box = box
 
     def cal_with_Qs(self):
+        D_max = L / 6 
         # 确保输入是 numpy 数组
-        positions = np.array(self.atom_list)
+        positions = np.array(self.atom_list)  # (N, 3)
 
-        # 使用广播机制计算两两点之间的向量差
-        diff = positions[:, np.newaxis, :] - positions[np.newaxis, :, :]  # (N, N, 3)
+        # 使用 scipy 计算距离矩阵并稀疏化
+        distance_matrix = cdist(positions, positions)  # (N, N)
+        np.fill_diagonal(distance_matrix, np.nan)  # 排除自身距离
 
-        # 计算欧几里得距离矩阵
-        distance_matrix = np.linalg.norm(diff, axis=-1)  # (N, N)
-        
-        # 排除自身距离（对角线元素为 0）
-        np.fill_diagonal(distance_matrix, 0)
+        # 稀疏化距离矩阵（仅保留距离 <= D_max 的点对）
+        mask = distance_matrix <= D_max
+        row, col = np.where(mask)
+        data = distance_matrix[mask]
+        sparse_distance_matrix = coo_matrix((data, (row, col)), shape=distance_matrix.shape)
 
-        N = self.atom_count
-        K = 1 / ((N + 1) * (N + 1)) 
+        N = len(self.atom_list)
+        K = 1 / ((N + 1) ** 2)  # 常数因子
 
-        result = []
+        # 将稀疏矩阵的值直接计算成结果
+        results = []
         for Q in self.QS:
-            new_distance_matrix = distance_matrix * Q
-            sin_distance_matrix = np.sin(new_distance_matrix)
-            ratio_matrix = sin_distance_matrix / distance_matrix 
-            sum_ratio = np.nansum(ratio_matrix) 
-            total_dis = K * sum_ratio / Q
-            result.append(total_dis)
+            # 直接计算 sin(Q * distance) / distance
+            scaled_data = sparse_distance_matrix.data * Q
+            sin_scaled_data = np.sin(scaled_data)
+            ratio_data = sin_scaled_data / sparse_distance_matrix.data
 
-        return result
+            # 计算总和
+            total_sum = np.sum(ratio_data)
+            total_dis = K * total_sum / Q
+            results.append(total_dis)
+
+        return results
 
 class AverageCalculator():
-    def __init__(self, file_path, max_workers, QS):
+    def __init__(self, file_name, max_workers, QS):
+        file_path = os.path.join(DATA_DIR,file_name)
+        self.file_name = file_name
         self.file_lines = file_line_generator(file_path)
         self.max_workers = max_workers
         self.frames = []
@@ -235,16 +249,43 @@ class AverageCalculator():
         else:
             return self.cal_arvage()
 
+    def save_cal_result(self,frame_id,frame_QS):
+        file_path = os.path.join(TMP_DIR,'{}_{}'.format(self.file_name,frame_id))
+        with open(file_path,"w") as f:
+            f.write(" ".join([str(q) for q in frame_QS]))
+
+    def read_cal_result(self,frame_id):
+        file_path = os.path.join(TMP_DIR,'{}_{}'.format(self.file_name,frame_id))
+        if not os.path.exists(file_path):
+            return False
+
+        with open(file_path,"r") as f:
+            result_str_list = f.read().split(" ")
+            return [float(r) for r in result_str_list]
+
     def cal_arvage_multprogress(self):
         print("cal_arvage_multprogress")
         Q_count = len(self.QS)
         Q_result = np.zeros((Q_count,))
+
+        need_cal_frame = []
+        for frame in self.frames:
+            result = self.read_cal_result(frame.frame_id)
+            if not result:
+                need_cal_frame.append(frame)
+            else:
+                log_info("skip : ",frame.frame_id)
+                Q_result += result
+
         with ProcessPoolExecutor(max_workers=self.max_workers) as executor:  # 创建线程池
-            future_to_frame = {executor.submit(frame.cal_with_Qs): frame for frame in self.frames}
+            future_to_frame = {executor.submit(frame.cal_with_Qs): frame for frame in need_cal_frame}
             for future in as_completed(future_to_frame):
+                frame = future_to_frame[future]
                 frame_QS = future.result()
                 Q_result += frame_QS
-                # log_info("finish : ",future_to_frame[future].frame_id)
+                log_info("finish : ",frame.frame_id)
+                self.save_cal_result(frame.frame_id,frame_QS)
+
         return Q_result / len(self.frames)
 
     def cal_arvage(self):
@@ -280,27 +321,31 @@ def save_result(file_name, result):
         f.write("# Q-values       P(Q)  \n")
         f.write(result)
 
+L = 300
+begin, end = 1, 100
+q0, qmax, M = begin * 2 * math.pi / L, end * 2 * math.pi / L, end
+max_workers = 5
+
 def main():
     os.makedirs(DATA_DIR, exist_ok=True)
     os.makedirs(RESULT_DIR, exist_ok=True)
+    os.makedirs(TMP_DIR, exist_ok=True)
+
 
 
     file_names = []
-    file_names.append("single1.atom")
+    file_names.append("test.atom")
     # file_names.append("md100.atom")
     # file_names.append("md125.atom")
     # file_names.append("md150.atom")
     # file_names.append("md175.atom")
-    L = 300
-    begin, end = 1, 200
-    q0, qmax, M = begin * 2 * math.pi / L, end * 2 * math.pi / L, end
-    max_workers = 4
+
     for file_name in file_names:
         begin_time = int(time.time())
         print("begin", begin_time)
         QS = list(np.linspace(q0, qmax, M))
         file_path = os.path.join(DATA_DIR,file_name)
-        ac = AverageCalculator(file_path,max_workers,QS)
+        ac = AverageCalculator(file_name,max_workers,QS)
         QP = ac.format_print_cal_result()
         save_result(file_name,QP)
         end_time = int(time.time())
@@ -310,10 +355,13 @@ def main():
 def spilit2test():
     contentList = []
     with open("data/md100.atom","r") as f:
-        for i in range(5009 * 2 - 1):
+        for i in range(5009 * 20 - 1):
             contentList.append(f.readline())
     with open("data/test.atom","w") as f:
         f.write("".join(contentList))
+
+def clear():
+    shutil.rmtree(TMP_DIR) 
 
 def print_help():
     print("1.文件放入data目录")
@@ -321,7 +369,8 @@ def print_help():
 
 
 if __name__ == '__main__':
-    spilit2test()
+    # spilit2test()
+    clear()
     main()
 
 

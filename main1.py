@@ -143,7 +143,6 @@ class Frame():
         self.box = box
 
     def cal_with_Qs(self):
-        D_max = L / 6 
         # 确保输入是 numpy 数组
         positions = np.array(self.atom_list)  # (N, 3)
 
@@ -321,10 +320,11 @@ def save_result(file_name, result):
         f.write("# Q-values       P(Q)  \n")
         f.write(result)
 
-L = 300
+L = 300 #盒子长度
+D_max = 300 #小于这个距离的点才会计算 缩小这个值可以加速
 begin, end = 1, 100
 q0, qmax, M = begin * 2 * math.pi / L, end * 2 * math.pi / L, end
-max_workers = 5
+max_workers = 5   #进程数
 
 def main():
     os.makedirs(DATA_DIR, exist_ok=True)
@@ -369,8 +369,8 @@ def print_help():
 
 
 if __name__ == '__main__':
-    # spilit2test()
-    clear()
+    # spilit2test()     #裁剪文件
+    # clear()           #参数不同处理文件不同的时候需要清理
     main()
 
 
